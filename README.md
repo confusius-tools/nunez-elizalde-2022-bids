@@ -19,7 +19,8 @@ mice. This converter currently only exports the fUSI-related content.
 
 - Raw data: `sub-*/ses-*/fusi/*_pwd.nii.gz` (+ sidecars and events).
 - Angiography: `sub-*/ses-*/angio/*_pwd.nii.gz`.
-- Derivatives: `derivatives/allenccf_align/sub-*/ses-*/fusi/*`.
+- Derivatives: `derivatives/allenccf_align/sub-*/ses-*/fusi/*` plus
+  `derivatives/allenccf_align/structure_tree_safe_2017.csv` for atlas label colors.
 - Source-only files: `sourcedata/allenccf_align/.../*.hdf`.
 - Dataset tables: `participants.tsv/json`, `sub-*/sub-*_sessions.tsv/json`.
 - Conversion log: `code/conversion_manifest.tsv`.

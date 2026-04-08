@@ -28,6 +28,8 @@ from scipy.io import loadmat
 
 from .config import STATIC_METADATA, TASK_DESCRIPTIONS
 
+STRUCTURE_TREE_FILENAME = "structure_tree_safe_2017.csv"
+
 
 @dataclass
 class SessionMetadata:
@@ -635,6 +637,17 @@ def _write_sourcedata_readme(sourcedata_root: Path) -> None:
     (sourcedata_root / "README").write_text(readme)
 
 
+def _copy_structure_tree_csv(src_subjects_dir: Path, derivatives_root: Path) -> bool:
+    """Copy the Allen structure tree CSV into the derivatives root when present."""
+    source_csv = src_subjects_dir / "extras" / STRUCTURE_TREE_FILENAME
+    if not source_csv.exists():
+        return False
+
+    destination_csv = derivatives_root / STRUCTURE_TREE_FILENAME
+    shutil.copy2(source_csv, destination_csv)
+    return True
+
+
 def _extract_probe_track_hdf(
     source_hdf: Path,
     destination_tsv: Path,
@@ -744,6 +757,12 @@ def _copy_angio_and_derivatives(
     sourcedata_root = out_dir / "sourcedata" / "allenccf_align"
     sourcedata_root.mkdir(parents=True, exist_ok=True)
     _write_sourcedata_readme(sourcedata_root)
+
+    if session_metadata:
+        sample_metadata = next(iter(session_metadata.values()))
+        src_subjects_dir = sample_metadata.session_dir.parent.parent
+        if _copy_structure_tree_csv(src_subjects_dir, derivatives_root):
+            print("Copied structure_tree_safe_2017.csv to derivatives/allenccf_align/.")
 
     derivative_patterns = [
         "*_fusi_slice_acq.nii.gz",
