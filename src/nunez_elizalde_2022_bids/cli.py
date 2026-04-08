@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 
 from .converter import convert
@@ -39,6 +40,76 @@ def build_parser() -> argparse.ArgumentParser:
         help="Plan conversion and write a manifest without generating NIfTI files.",
     )
     return parser
+
+
+def build_upload_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Upload the fUSI-BIDS dataset to OSF and regenerate the\n"
+            "dataset index used by confusius.datasets.\n\n"
+            "Requires an OSF personal access token:\n"
+            "  1. Log in at https://osf.io\n"
+            "  2. Go to Settings > Personal Access Tokens\n"
+            "  3. Create a token with the 'osf.full_write' scope\n"
+            "  4. Pass it via --token or set the OSF_TOKEN environment variable."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "--bids-dir",
+        type=Path,
+        help="Local BIDS root directory to upload. Skipped with --index-only.",
+    )
+    parser.add_argument(
+        "--project",
+        default="43skw",
+        help="OSF project ID (default: 43skw).",
+    )
+    parser.add_argument(
+        "--token",
+        default=None,
+        help="OSF personal access token. Falls back to OSF_TOKEN env var.",
+    )
+    parser.add_argument(
+        "--update",
+        action="store_true",
+        help="Re-upload files that differ from OSF (skip identical files).",
+    )
+    parser.add_argument(
+        "--index-only",
+        action="store_true",
+        help="Skip file upload; only regenerate and upload dataset_index.json.",
+    )
+    return parser
+
+
+def upload_main() -> None:
+    from .upload import generate_index, upload_dataset, upload_index
+
+    args = build_upload_parser().parse_args()
+
+    token = args.token or os.environ.get("OSF_TOKEN")
+    if not token:
+        print(
+            "Error: OSF token required. "
+            "Pass --token or set the OSF_TOKEN environment variable.\n"
+            "Get a token at https://osf.io > Settings > Personal Access Tokens."
+        )
+        raise SystemExit(1)
+
+    if not args.index_only:
+        if args.bids_dir is None:
+            print("Error: --bids-dir is required unless --index-only is set.")
+            raise SystemExit(1)
+        upload_dataset(args.bids_dir, token, args.project, update=args.update)
+
+    print("Generating index from OSF storage...")
+    index = generate_index(token, args.project)
+    print(f"Index contains {len(index)} files.")
+
+    print("Uploading dataset_index.json to OSF...")
+    upload_index(index, token, args.project)
+    print("Done.")
 
 
 def main() -> None:
