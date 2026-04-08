@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import configparser
 import csv
-from datetime import datetime, timedelta
 import json
 import math
 import re
 import shutil
 from collections import defaultdict
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -435,6 +435,7 @@ def _build_dataset_metadata(out_dir: Path, subjects: list[str]) -> None:
     (out_dir / "README").write_text(readme_text)
 
     bidsignore_text = (
+        "dataset_index.json\n"
         "code/**\n"
         "sourcedata/**\n"
         "derivatives/**\n"

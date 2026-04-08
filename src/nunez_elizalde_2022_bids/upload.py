@@ -61,7 +61,7 @@ def generate_index(
             # /nunez-elizalde-2022-bids/sub-CR020/ses-20191122/angio/...
             materialized = file.path.lstrip("/")
             if materialized.startswith(prefix):
-                rel_path = materialized[len(prefix):]
+                rel_path = materialized[len(prefix) :]
                 if rel_path:
                     index[rel_path] = file.osf_path
                     progress.advance(task)
