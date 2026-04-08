@@ -1,0 +1,21 @@
+[project]
+name = "nunez-elizalde-2022-bids"
+version = "0.1.0"
+description = "Convert Nunez-Elizalde et al. 2022 fUSI recordings to BIDS"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "confusius>=0.0.1a23",
+    "h5py>=3.15.0",
+    "numpy>=2.3.0",
+    "rich>=14.2.0",
+    "scipy>=1.16.0",
+    "xarray>=2025.9.0",
+]
+
+[project.scripts]
+nunez-convert = "nunez_elizalde_2022_bids.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.9.11,<0.12.0"]
+build-backend = "uv_build"
