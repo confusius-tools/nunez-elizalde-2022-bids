@@ -3,9 +3,11 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import time
 from pathlib import Path
 
 from osfclient.api import OSF
+from requests.exceptions import RequestException
 from rich.progress import (
     BarColumn,
     MofNCompleteColumn,
@@ -19,6 +21,28 @@ from rich.progress import (
 OSF_PROJECT_ID = "43skw"
 BIDS_ROOT_NAME = "nunez-elizalde-2022-bids"
 INDEX_FILENAME = "dataset_index.json"
+
+
+def _is_retryable_upload_error(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    if isinstance(exc, RequestException):
+        return True
+    if not isinstance(exc, RuntimeError):
+        return False
+    return any(
+        token in msg
+        for token in (
+            "status code 404",
+            "status code 408",
+            "status code 429",
+            "status code 500",
+            "status code 502",
+            "status code 503",
+            "status code 504",
+            "connection error",
+            "timed out",
+        )
+    )
 
 
 def _get_storage(token: str, project_id: str):
@@ -95,6 +119,28 @@ def upload_dataset(
     bids_dir = Path(bids_dir)
     storage = _get_storage(token, project_id)
     all_files = sorted(p for p in bids_dir.rglob("*") if p.is_file())
+    max_attempts = 5
+
+    existing_remote_paths: set[str] = set()
+    if not update:
+        prefix = BIDS_ROOT_NAME + "/"
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            TimeElapsedColumn(),
+        ) as progress:
+            task = progress.add_task(
+                "Scanning existing OSF files for resume support...",
+                total=None,
+            )
+            for remote_file in storage.files:
+                materialized = remote_file.path.lstrip("/")
+                if materialized.startswith(prefix):
+                    existing_remote_paths.add(materialized)
+                    progress.advance(task)
+
+    uploaded = 0
+    skipped = 0
 
     with Progress(
         SpinnerColumn(),
@@ -111,13 +157,43 @@ def upload_dataset(
             remote_path = f"{BIDS_ROOT_NAME}/{rel}"
             progress.update(task, description=f"Uploading {local_path.name}...")
 
+            if not update and remote_path in existing_remote_paths:
+                skipped += 1
+                progress.advance(task)
+                continue
+
             with open(local_path, "rb") as fp:
-                try:
-                    storage.create_file(remote_path, fp, update=update)
-                except FileExistsError:
-                    pass
+                for attempt in range(1, max_attempts + 1):
+                    fp.seek(0)
+                    try:
+                        storage.create_file(remote_path, fp, update=update)
+                    except FileExistsError:
+                        skipped += 1
+                        existing_remote_paths.add(remote_path)
+                        break
+                    except Exception as exc:
+                        if attempt >= max_attempts or not _is_retryable_upload_error(
+                            exc
+                        ):
+                            raise
+                        wait_seconds = min(2 ** (attempt - 1), 30)
+                        progress.update(
+                            task,
+                            description=(
+                                f"Retry {attempt}/{max_attempts - 1} "
+                                f"for {local_path.name} in {wait_seconds}s..."
+                            ),
+                        )
+                        time.sleep(wait_seconds)
+                        storage = _get_storage(token, project_id)
+                    else:
+                        uploaded += 1
+                        existing_remote_paths.add(remote_path)
+                        break
 
             progress.advance(task)
+
+    print(f"Upload complete: {uploaded} uploaded, {skipped} skipped.")
 
 
 def upload_index(
