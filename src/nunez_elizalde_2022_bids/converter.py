@@ -41,6 +41,7 @@ class SessionMetadata:
     block_to_task: dict[int, str]
     block_to_slice_index: dict[int, int]
     slice_positions_mm: list[float]
+    ystack_positions_mm: np.ndarray
     ystack_x_axis_mm: np.ndarray
     ystack_depth_axis_mm: np.ndarray
     plane_wave_angles_deg: list[float] | None
@@ -163,6 +164,14 @@ def _load_session_metadata(session_dir: Path) -> SessionMetadata:
         for v in _parse_number_list(config.get("fusi", "slice_positions"))
         if not math.isnan(v)
     ]
+    ystack_positions_mm = np.asarray(
+        [
+            float(v)
+            for v in _parse_number_list(config.get("fusi", "ystack_positions"))
+            if not math.isnan(v)
+        ],
+        dtype=float,
+    )
 
     ystack = loadmat(ystack_path, simplify_cells=True)
     params = ystack["params"]
@@ -207,6 +216,7 @@ def _load_session_metadata(session_dir: Path) -> SessionMetadata:
         block_to_task=block_to_task,
         block_to_slice_index=block_to_slice_index,
         slice_positions_mm=slice_positions_mm,
+        ystack_positions_mm=ystack_positions_mm,
         ystack_x_axis_mm=x_axis,
         ystack_depth_axis_mm=depth_axis,
         plane_wave_angles_deg=plane_wave_angles_deg,
@@ -510,6 +520,10 @@ def _build_angio_sidecar(
         sidecar["PlaneWaveAngles"] = metadata.plane_wave_angles_deg
     if metadata.probe_voltage_v is not None:
         sidecar["ProbeVoltage"] = metadata.probe_voltage_v
+    if metadata.ystack_positions_mm.size > 0:
+        sidecar["YStackPositions"] = [
+            float(v) for v in metadata.ystack_positions_mm.tolist()
+        ]
 
     return sidecar
 
@@ -589,7 +603,13 @@ def _to_confusius_stack_convention(da: xr.DataArray) -> xr.DataArray:
     )
 
 
-def _save_conformed_nifti(source: Path, destination: Path) -> None:
+def _save_conformed_nifti(
+    source: Path,
+    destination: Path,
+    *,
+    z_positions_mm: np.ndarray | None = None,
+    require_z_match: bool = False,
+) -> None:
     try:
         import confusius as cf
     except ImportError as exc:
@@ -600,6 +620,25 @@ def _save_conformed_nifti(source: Path, destination: Path) -> None:
 
     da = cf.load(source)
     da_conformed = _to_confusius_stack_convention(da)
+
+    if z_positions_mm is not None and "z" in da_conformed.dims:
+        z_positions = np.asarray(z_positions_mm, dtype=float).ravel()
+        if da_conformed.sizes["z"] == z_positions.size:
+            z_attrs = dict(da_conformed.coords["z"].attrs)
+            z_attrs["units"] = "mm"
+            z_step = _median_step(z_positions)
+            if z_step is not None:
+                z_attrs["voxdim"] = float(z_step)
+            da_conformed = da_conformed.assign_coords(
+                z=xr.DataArray(z_positions, dims=("z",), attrs=z_attrs)
+            )
+        elif require_z_match:
+            raise ValueError(
+                "Cannot assign z positions: "
+                f"{source.name} has z size {da_conformed.sizes['z']}, "
+                f"but metadata has {z_positions.size} y-stack positions."
+            )
+
     destination.parent.mkdir(parents=True, exist_ok=True)
     cf.save(da_conformed, destination)
 
@@ -779,7 +818,12 @@ def _copy_angio_and_derivatives(
         angio_source = _find_angio_source(metadata)
         if angio_source is not None:
             angio_output = _angio_output_path(out_dir, metadata.subject, metadata.date)
-            _save_conformed_nifti(angio_source, angio_output)
+            _save_conformed_nifti(
+                angio_source,
+                angio_output,
+                z_positions_mm=metadata.ystack_positions_mm,
+                require_z_match=True,
+            )
 
             angio_json = angio_output.with_suffix("").with_suffix(".json")
             angio_sidecar = _build_angio_sidecar(metadata, source_file=angio_source)
@@ -805,7 +849,17 @@ def _copy_angio_and_derivatives(
                     metadata.date,
                     source.name,
                 )
-                _save_conformed_nifti(source, destination / target_name)
+                use_ystack_z = target_name.endswith(
+                    "_desc-sliceacq_pwd.nii.gz"
+                ) or target_name.endswith("_space-fusi_desc-allenccf_dseg.nii.gz")
+                _save_conformed_nifti(
+                    source,
+                    destination / target_name,
+                    z_positions_mm=metadata.ystack_positions_mm
+                    if use_ystack_z
+                    else None,
+                    require_z_match=use_ystack_z,
+                )
 
         for source_hdf in sorted(
             align_dir.glob("*_estimated_probe*_3Dtrack_manual.hdf")
