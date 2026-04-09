@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
-import tempfile
 import time
 from pathlib import Path
 
@@ -209,6 +207,34 @@ def _upload_file_once(
         fp.seek(0)
         existing.update(fp)
         return "uploaded", existing.osf_path
+
+
+def _upload_index_once(bids_root_folder: Storage, index_bytes: bytes) -> None:
+    response = bids_root_folder._put(
+        bids_root_folder._new_file_url,
+        params={"name": INDEX_FILENAME},
+        data=index_bytes,
+    )
+
+    if response.status_code in (200, 201):
+        return
+
+    if response.status_code != 409:
+        raise RuntimeError(
+            f"Could not upload {INDEX_FILENAME} (status code {response.status_code})."
+        )
+
+    existing = _file_from_folder_name(bids_root_folder, INDEX_FILENAME)
+    if existing is None:
+        raise RuntimeError(
+            f"Could not resolve existing {INDEX_FILENAME} after conflict."
+        )
+
+    update_response = existing._put(existing._upload_url, data=index_bytes)
+    if update_response.status_code != 200:
+        raise RuntimeError(
+            f"Could not update {INDEX_FILENAME} (status code {update_response.status_code})."
+        )
 
 
 def generate_index(
@@ -419,18 +445,24 @@ def upload_index(
     project_id : str, default: "43skw"
         OSF project ID.
     """
-    storage = _get_storage(token, project_id)
-    remote_path = f"{BIDS_ROOT_NAME}/{INDEX_FILENAME}"
+    max_attempts = 5
     index_bytes = json.dumps(index, indent=2, sort_keys=True).encode()
 
-    # osfclient requires a file-like object with a .mode attribute,
-    # so we write to a temporary file rather than using BytesIO.
-    with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as tmp:
-        tmp.write(index_bytes)
-        tmp_path = tmp.name
-
-    try:
-        with open(tmp_path, "rb") as fp:
-            storage.create_file(remote_path, fp, force=True)
-    finally:
-        os.unlink(tmp_path)
+    for attempt in range(1, max_attempts + 1):
+        try:
+            storage = _get_storage(token, project_id)
+            bids_root_folder = storage.create_folder(BIDS_ROOT_NAME, exist_ok=True)
+            _upload_index_once(bids_root_folder, index_bytes)
+        except Exception as exc:
+            if attempt >= max_attempts or not _is_retryable_upload_error(exc):
+                raise
+            wait_seconds = min(2 ** (attempt - 1), 30)
+            print(
+                "Retry "
+                f"{attempt}/{max_attempts - 1} for {INDEX_FILENAME} "
+                f"in {wait_seconds}s..."
+            )
+            time.sleep(wait_seconds)
+            continue
+        else:
+            return
