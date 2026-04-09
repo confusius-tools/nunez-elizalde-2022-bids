@@ -7,6 +7,7 @@ import time
 from pathlib import Path
 
 from osfclient.api import OSF
+from osfclient.models.storage import File, Storage, checksum, file_empty
 from requests.exceptions import RequestException
 from rich.progress import (
     BarColumn,
@@ -49,6 +50,165 @@ def _get_storage(token: str, project_id: str):
     osf = OSF(token=token)
     project = osf.project(project_id)
     return project.storage()
+
+
+def _load_remote_index(bids_root_folder: Storage) -> dict[str, str]:
+    index_file: File | None = None
+    for remote_file in bids_root_folder.files:
+        if remote_file.name == INDEX_FILENAME:
+            index_file = remote_file
+            break
+
+    if index_file is None:
+        return {}
+
+    try:
+        response = index_file._get(index_file._download_url)
+        if response.status_code != 200:
+            return {}
+        payload = response.json()
+    except Exception:
+        return {}
+
+    if not isinstance(payload, dict):
+        return {}
+
+    return {str(k): v for k, v in payload.items() if isinstance(v, str)}
+
+
+def _ensure_parent_folder(
+    rel_dir: str,
+    folder_cache: dict[str, Storage],
+) -> tuple[str, Storage]:
+    if rel_dir in ("", "."):
+        return "", folder_cache[""]
+
+    current = ""
+    for part in rel_dir.split("/"):
+        parent = current
+        current = f"{current}/{part}" if current else part
+        if current not in folder_cache:
+            folder_cache[current] = folder_cache[parent].create_folder(
+                part, exist_ok=True
+            )
+    return current, folder_cache[current]
+
+
+def _short_path(path: str, max_len: int = 72) -> str:
+    if len(path) <= max_len:
+        return path
+    return "..." + path[-(max_len - 3) :]
+
+
+def _file_from_osf_path(session, osf_path: str | None) -> File | None:
+    if not osf_path:
+        return None
+    file_id = osf_path.strip("/")
+    if not file_id:
+        return None
+
+    response = session.get(f"https://api.osf.io/v2/files/{file_id}/")
+    if response.status_code != 200:
+        return None
+
+    payload = response.json().get("data")
+    if not isinstance(payload, dict):
+        return None
+    return File(payload, session)
+
+
+def _file_from_folder_name(folder: Storage, filename: str) -> File | None:
+    files_url = getattr(folder, "_files_url", None)
+    if not isinstance(files_url, str):
+        return None
+
+    response = folder.session.get(files_url, params={"filter[name]": filename})
+    if response.status_code != 200:
+        return None
+
+    data = response.json().get("data")
+    if not isinstance(data, list):
+        return None
+
+    for item in data:
+        attrs = item.get("attributes", {})
+        if attrs.get("kind") == "file" and attrs.get("name") == filename:
+            return File(item, folder.session)
+    return None
+
+
+def _get_folder_file_map(
+    folder_key: str,
+    folder: Storage,
+    folder_file_cache: dict[str, dict[str, File]],
+) -> dict[str, File]:
+    cached = folder_file_cache.get(folder_key)
+    if cached is None:
+        cached = {remote_file.name: remote_file for remote_file in folder.files}
+        folder_file_cache[folder_key] = cached
+    return cached
+
+
+def _upload_file_once(
+    folder: Storage,
+    folder_key: str,
+    filename: str,
+    local_path: Path,
+    *,
+    update: bool,
+    folder_file_cache: dict[str, dict[str, File]],
+    local_md5_cache: dict[Path, str],
+    known_osf_path: str | None,
+) -> tuple[str, str | None]:
+    with open(local_path, "rb") as fp:
+        if file_empty(fp):
+            response = folder._put(
+                folder._new_file_url, params={"name": filename}, data=b""
+            )
+        else:
+            response = folder._put(
+                folder._new_file_url, params={"name": filename}, data=fp
+            )
+
+        if response.status_code in (200, 201):
+            folder_file_cache.pop(folder_key, None)
+            payload = response.json().get("data", {})
+            osf_path = payload.get("attributes", {}).get("path")
+            if isinstance(osf_path, str):
+                return "uploaded", osf_path
+            return "uploaded", None
+
+        if response.status_code != 409:
+            raise RuntimeError(
+                f"Could not upload {local_path} (status code {response.status_code})."
+            )
+
+        existing = _get_folder_file_map(folder_key, folder, folder_file_cache).get(
+            filename
+        )
+        if existing is None and known_osf_path is not None:
+            existing = _file_from_osf_path(folder.session, known_osf_path)
+        if existing is None:
+            existing = _file_from_folder_name(folder, filename)
+
+        if existing is None:
+            return "skipped", known_osf_path
+
+        if not update:
+            return "skipped", existing.osf_path
+
+        local_md5 = local_md5_cache.get(local_path)
+        if local_md5 is None:
+            local_md5 = checksum(local_path)
+            local_md5_cache[local_path] = local_md5
+
+        remote_md5 = (existing.hashes or {}).get("md5")
+        if remote_md5 and local_md5 == remote_md5:
+            return "skipped", existing.osf_path
+
+        fp.seek(0)
+        existing.update(fp)
+        return "uploaded", existing.osf_path
 
 
 def generate_index(
@@ -98,7 +258,7 @@ def upload_dataset(
     token: str,
     project_id: str = OSF_PROJECT_ID,
     update: bool = False,
-) -> None:
+) -> dict[str, str]:
     """Upload all files from a local BIDS directory to OSF.
 
     Files are uploaded under the ``nunez-elizalde-2022-bids/`` folder in the
@@ -115,29 +275,37 @@ def upload_dataset(
     update : bool, default: False
         Re-upload files that differ from the remote copy. When False, existing
         files are skipped.
+
+    Returns
+    -------
+    index : dict[str, str]
+        Incrementally updated path-to-OSF-ID mapping suitable for
+        ``dataset_index.json`` upload.
     """
     bids_dir = Path(bids_dir)
     storage = _get_storage(token, project_id)
+    bids_root_folder = storage.create_folder(BIDS_ROOT_NAME, exist_ok=True)
+    folder_cache: dict[str, Storage] = {"": bids_root_folder}
+    folder_file_cache: dict[str, dict[str, File]] = {}
+    local_md5_cache: dict[Path, str] = {}
     all_files = sorted(p for p in bids_dir.rglob("*") if p.is_file())
     max_attempts = 5
 
-    existing_remote_paths: set[str] = set()
-    if not update:
-        prefix = BIDS_ROOT_NAME + "/"
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            TimeElapsedColumn(),
-        ) as progress:
-            task = progress.add_task(
-                "Scanning existing OSF files for resume support...",
-                total=None,
-            )
-            for remote_file in storage.files:
-                materialized = remote_file.path.lstrip("/")
-                if materialized.startswith(prefix):
-                    existing_remote_paths.add(materialized)
-                    progress.advance(task)
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        TimeElapsedColumn(),
+        transient=True,
+    ) as progress:
+        progress.add_task("Loading existing dataset_index.json from OSF...", total=None)
+        remote_index = _load_remote_index(bids_root_folder)
+
+    if remote_index:
+        print(f"Loaded {len(remote_index)} existing index entries.")
+    else:
+        print("No valid remote index found; starting from an empty baseline.")
+
+    index: dict[str, str] = dict(remote_index)
 
     uploaded = 0
     skipped = 0
@@ -154,46 +322,83 @@ def upload_dataset(
 
         for local_path in all_files:
             rel = local_path.relative_to(bids_dir)
-            remote_path = f"{BIDS_ROOT_NAME}/{rel}"
-            progress.update(task, description=f"Uploading {local_path.name}...")
+            rel_path = rel.as_posix()
+            rel_dir = rel.parent.as_posix()
+            filename = rel.name
+            known_osf_path = remote_index.get(rel_path)
+            progress.update(
+                task,
+                description=(
+                    f"Uploading ({uploaded} up / {skipped} skip): "
+                    f"{_short_path(rel_path)}"
+                ),
+            )
 
-            if not update and remote_path in existing_remote_paths:
+            if not update and rel_path in remote_index:
                 skipped += 1
                 progress.advance(task)
                 continue
 
-            with open(local_path, "rb") as fp:
-                for attempt in range(1, max_attempts + 1):
-                    fp.seek(0)
-                    try:
-                        storage.create_file(remote_path, fp, update=update)
-                    except FileExistsError:
-                        skipped += 1
-                        existing_remote_paths.add(remote_path)
-                        break
-                    except Exception as exc:
-                        if attempt >= max_attempts or not _is_retryable_upload_error(
-                            exc
-                        ):
-                            raise
-                        wait_seconds = min(2 ** (attempt - 1), 30)
-                        progress.update(
-                            task,
-                            description=(
-                                f"Retry {attempt}/{max_attempts - 1} "
-                                f"for {local_path.name} in {wait_seconds}s..."
-                            ),
-                        )
-                        time.sleep(wait_seconds)
-                        storage = _get_storage(token, project_id)
-                    else:
-                        uploaded += 1
-                        existing_remote_paths.add(remote_path)
-                        break
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    folder_key, parent_folder = _ensure_parent_folder(
+                        rel_dir, folder_cache
+                    )
+                    status, osf_path = _upload_file_once(
+                        parent_folder,
+                        folder_key,
+                        filename,
+                        local_path,
+                        update=update,
+                        folder_file_cache=folder_file_cache,
+                        local_md5_cache=local_md5_cache,
+                        known_osf_path=known_osf_path,
+                    )
+                except Exception as exc:
+                    if attempt >= max_attempts or not _is_retryable_upload_error(exc):
+                        raise
+                    wait_seconds = min(2 ** (attempt - 1), 30)
+                    progress.update(
+                        task,
+                        description=(
+                            f"Retry {attempt}/{max_attempts - 1} "
+                            f"for {local_path.name} in {wait_seconds}s..."
+                        ),
+                    )
+                    time.sleep(wait_seconds)
+
+                    storage = _get_storage(token, project_id)
+                    bids_root_folder = storage.create_folder(
+                        BIDS_ROOT_NAME, exist_ok=True
+                    )
+                    folder_cache = {"": bids_root_folder}
+                    folder_file_cache = {}
+                    continue
+
+                if status == "uploaded":
+                    uploaded += 1
+                else:
+                    skipped += 1
+
+                if osf_path is None:
+                    existing = _get_folder_file_map(
+                        folder_key,
+                        parent_folder,
+                        folder_file_cache,
+                    ).get(filename)
+                    if existing is not None:
+                        osf_path = existing.osf_path
+
+                if osf_path is not None:
+                    index[rel_path] = osf_path
+                elif rel_path in remote_index:
+                    index[rel_path] = remote_index[rel_path]
+                break
 
             progress.advance(task)
 
     print(f"Upload complete: {uploaded} uploaded, {skipped} skipped.")
+    return index
 
 
 def upload_index(

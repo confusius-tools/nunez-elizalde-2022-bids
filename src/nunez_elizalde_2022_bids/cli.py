@@ -80,6 +80,14 @@ def build_upload_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Skip file upload; only regenerate and upload dataset_index.json.",
     )
+    parser.add_argument(
+        "--rebuild-index",
+        action="store_true",
+        help=(
+            "Ignore incremental index updates and rebuild dataset_index.json "
+            "by scanning OSF storage."
+        ),
+    )
     return parser
 
 
@@ -97,14 +105,20 @@ def upload_main() -> None:
         )
         raise SystemExit(1)
 
+    index: dict[str, str] | None = None
+
     if not args.index_only:
         if args.bids_dir is None:
             print("Error: --bids-dir is required unless --index-only is set.")
             raise SystemExit(1)
-        upload_dataset(args.bids_dir, token, args.project, update=args.update)
+        index = upload_dataset(args.bids_dir, token, args.project, update=args.update)
 
-    print("Generating index from OSF storage...")
-    index = generate_index(token, args.project)
+    if args.rebuild_index or args.index_only or index is None:
+        print("Generating index from OSF storage...")
+        index = generate_index(token, args.project)
+    else:
+        print("Using incrementally updated index from upload run...")
+
     print(f"Index contains {len(index)} files.")
 
     print("Uploading dataset_index.json to OSF...")
