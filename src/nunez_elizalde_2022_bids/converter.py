@@ -609,6 +609,7 @@ def _save_conformed_nifti(
     *,
     z_positions_mm: np.ndarray | None = None,
     require_z_match: bool = False,
+    output_dtype: np.dtype[Any] | None = None,
 ) -> None:
     try:
         import confusius as cf
@@ -638,6 +639,9 @@ def _save_conformed_nifti(
                 f"{source.name} has z size {da_conformed.sizes['z']}, "
                 f"but metadata has {z_positions.size} y-stack positions."
             )
+
+    if output_dtype is not None:
+        da_conformed = da_conformed.astype(output_dtype)
 
     destination.parent.mkdir(parents=True, exist_ok=True)
     cf.save(da_conformed, destination)
@@ -852,6 +856,7 @@ def _copy_angio_and_derivatives(
                 use_ystack_z = target_name.endswith(
                     "_desc-sliceacq_pwd.nii.gz"
                 ) or target_name.endswith("_space-fusi_desc-allenccf_dseg.nii.gz")
+                is_dseg = target_name.endswith("_space-fusi_desc-allenccf_dseg.nii.gz")
                 _save_conformed_nifti(
                     source,
                     destination / target_name,
@@ -859,6 +864,7 @@ def _copy_angio_and_derivatives(
                     if use_ystack_z
                     else None,
                     require_z_match=use_ystack_z,
+                    output_dtype=np.int32 if is_dseg else None,
                 )
 
         for source_hdf in sorted(
