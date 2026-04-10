@@ -7,6 +7,7 @@ from pathlib import Path
 from osfclient.api import OSF
 from osfclient.models.storage import File, Storage, checksum, file_empty
 from requests.exceptions import RequestException
+from rich.console import Console
 from rich.progress import (
     BarColumn,
     MofNCompleteColumn,
@@ -20,6 +21,21 @@ from rich.progress import (
 OSF_PROJECT_ID = "43skw"
 BIDS_ROOT_NAME = "nunez-elizalde-2022-bids"
 INDEX_FILENAME = "dataset_index.json"
+CONSOLE = Console()
+
+
+def _print_retry_message(
+    context: str,
+    attempt: int,
+    max_attempts: int,
+    wait_seconds: int,
+    exc: Exception,
+) -> None:
+    CONSOLE.print(
+        f"[bold yellow]Retryable OSF error[/] during {context} "
+        f"[dim](attempt {attempt}/{max_attempts})[/dim]: {exc}. "
+        f"Retrying in [bold]{wait_seconds}s[/]..."
+    )
 
 
 def _is_retryable_upload_error(exc: Exception) -> bool:
@@ -88,7 +104,7 @@ def _load_remote_index(bids_root_folder: Storage) -> dict[str, str]:
     if not isinstance(payload, dict):
         return {}
 
-    return {str(k): v for k, v in payload.items() if isinstance(v, str)}
+    return {str(key): value for key, value in payload.items() if isinstance(value, str)}
 
 
 def _ensure_parent_folder(
@@ -275,7 +291,7 @@ def _build_index_with_retry(
                 TimeElapsedColumn(),
                 transient=True,
             ) as progress:
-                task = progress.add_task("Scanning OSF storage...", total=None)
+                task = progress.add_task("[cyan]Scanning OSF storage...[/]", total=None)
                 for remote_file in storage.files:
                     materialized = remote_file.path.lstrip("/")
                     if materialized.startswith(prefix):
@@ -287,10 +303,12 @@ def _build_index_with_retry(
             if attempt >= max_attempts or not _is_retryable_upload_error(exc):
                 raise
             wait_seconds = min(2 ** (attempt - 1), 30)
-            print(
-                "Transient OSF error while building dataset index "
-                f"(attempt {attempt}/{max_attempts}): {exc}. "
-                f"Retrying in {wait_seconds}s..."
+            _print_retry_message(
+                context="dataset index scan",
+                attempt=attempt,
+                max_attempts=max_attempts,
+                wait_seconds=wait_seconds,
+                exc=exc,
             )
             time.sleep(wait_seconds)
             continue
@@ -352,7 +370,7 @@ def upload_dataset(
         ``dataset_index.json`` upload.
     """
     bids_dir = Path(bids_dir)
-    all_files = sorted(p for p in bids_dir.rglob("*") if p.is_file())
+    all_files = sorted(path for path in bids_dir.rglob("*") if path.is_file())
     max_attempts = 5
     storage = _get_storage_with_retry(token, project_id, max_attempts=max_attempts)
     bids_root_folder = storage.create_folder(BIDS_ROOT_NAME, exist_ok=True)
@@ -366,13 +384,15 @@ def upload_dataset(
         TimeElapsedColumn(),
         transient=True,
     ) as progress:
-        progress.add_task("Loading existing dataset_index.json from OSF...", total=None)
+        progress.add_task(
+            "[cyan]Loading existing dataset_index.json from OSF...[/]", total=None
+        )
         remote_index = _load_remote_index(bids_root_folder)
 
     if remote_index:
-        print(f"Loaded {len(remote_index)} existing index entries.")
+        CONSOLE.print(f"[green]Loaded {len(remote_index)} existing index entries.[/]")
     else:
-        print("No valid remote index found; starting from an empty baseline.")
+        CONSOLE.print("[yellow]No valid remote index found; starting from empty.[/]")
 
     index: dict[str, str] = dict(remote_index)
     uploaded = 0
@@ -386,7 +406,10 @@ def upload_dataset(
         TimeElapsedColumn(),
         TimeRemainingColumn(),
     ) as progress:
-        task = progress.add_task("Uploading...", total=len(all_files))
+        task = progress.add_task(
+            "[cyan]Uploading files to OSF...[/]",
+            total=len(all_files),
+        )
 
         for local_path in all_files:
             rel = local_path.relative_to(bids_dir)
@@ -398,8 +421,8 @@ def upload_dataset(
             progress.update(
                 task,
                 description=(
-                    f"Uploading ({uploaded} up / {skipped} skip): "
-                    f"{_short_path(rel_path)}"
+                    f"[cyan]Uploading[/] ({uploaded} up / {skipped} skip): "
+                    f"[white]{_short_path(rel_path)}[/]"
                 ),
             )
 
@@ -431,8 +454,9 @@ def upload_dataset(
                     progress.update(
                         task,
                         description=(
-                            f"Retry {attempt}/{max_attempts - 1} "
-                            f"for {local_path.name} in {wait_seconds}s..."
+                            f"[yellow]Retry {attempt}/{max_attempts - 1}[/] "
+                            f"for [white]{local_path.name}[/] "
+                            f"in [bold]{wait_seconds}s[/]..."
                         ),
                     )
                     time.sleep(wait_seconds)
@@ -469,7 +493,10 @@ def upload_dataset(
 
             progress.advance(task)
 
-    print(f"Upload complete: {uploaded} uploaded, {skipped} skipped.")
+    CONSOLE.print(
+        "[bold green]Upload complete[/]: "
+        f"[green]{uploaded} uploaded[/], [yellow]{skipped} skipped[/]."
+    )
     return index
 
 
@@ -507,10 +534,12 @@ def upload_index(
             if attempt >= max_attempts or not _is_retryable_upload_error(exc):
                 raise
             wait_seconds = min(2 ** (attempt - 1), 30)
-            print(
-                "Transient OSF error while uploading dataset index "
-                f"(attempt {attempt}/{max_attempts}): {exc}. "
-                f"Retrying in {wait_seconds}s..."
+            _print_retry_message(
+                context="dataset index upload",
+                attempt=attempt,
+                max_attempts=max_attempts,
+                wait_seconds=wait_seconds,
+                exc=exc,
             )
             time.sleep(wait_seconds)
             continue

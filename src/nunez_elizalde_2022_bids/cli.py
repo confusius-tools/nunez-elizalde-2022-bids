@@ -4,7 +4,11 @@ import argparse
 import os
 from pathlib import Path
 
+from rich.console import Console
+
 from .converter import convert
+
+CONSOLE = Console()
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -98,32 +102,47 @@ def upload_main() -> None:
 
     token = args.token or os.environ.get("OSF_TOKEN")
     if not token:
-        print(
-            "Error: OSF token required. "
+        CONSOLE.print(
+            "[bold red]Error:[/] OSF token required. "
             "Pass --token or set the OSF_TOKEN environment variable.\n"
             "Get a token at https://osf.io > Settings > Personal Access Tokens."
         )
         raise SystemExit(1)
 
+    CONSOLE.rule("[bold blue]OSF Upload Workflow")
+    CONSOLE.print(f"[bold]Project[/]: [cyan]{args.project}[/]")
+    if args.index_only:
+        CONSOLE.print("[bold]Mode[/]: [yellow]Index only[/]")
+    else:
+        CONSOLE.print(f"[bold]BIDS directory[/]: [cyan]{args.bids_dir}[/]")
+        CONSOLE.print(
+            "[bold]Mode[/]: "
+            f"[cyan]{'Update existing files' if args.update else 'Skip existing files'}[/]"
+        )
+
     index: dict[str, str] | None = None
 
     if not args.index_only:
         if args.bids_dir is None:
-            print("Error: --bids-dir is required unless --index-only is set.")
+            CONSOLE.print(
+                "[bold red]Error:[/] --bids-dir is required unless --index-only is set."
+            )
             raise SystemExit(1)
+        CONSOLE.rule("[bold blue]Step 1/3: Upload Dataset Files")
         index = upload_dataset(args.bids_dir, token, args.project, update=args.update)
 
+    CONSOLE.rule("[bold blue]Step 2/3: Build Dataset Index")
     if args.rebuild_index or args.index_only or index is None:
-        print("Generating index from OSF storage...")
+        CONSOLE.print("[cyan]Generating index from OSF storage...[/]")
         index = generate_index(token, args.project)
     else:
-        print("Using incrementally updated index from upload run...")
+        CONSOLE.print("[cyan]Using incrementally updated index from upload run...[/]")
+    CONSOLE.print(f"[green]Index contains {len(index)} files.[/]")
 
-    print(f"Index contains {len(index)} files.")
-
-    print("Uploading dataset_index.json to OSF...")
+    CONSOLE.rule("[bold blue]Step 3/3: Upload Dataset Index")
+    CONSOLE.print("[cyan]Uploading dataset_index.json to OSF...[/]")
     upload_index(index, token, args.project)
-    print("Done.")
+    CONSOLE.rule("[bold green]Upload Finished")
 
 
 def main() -> None:
