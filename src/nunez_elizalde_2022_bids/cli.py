@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import os
 from pathlib import Path
+from typing import Any
 
 from rich.console import Console
 
@@ -96,7 +97,7 @@ def build_upload_parser() -> argparse.ArgumentParser:
 
 
 def upload_main() -> None:
-    from .upload import generate_index, upload_dataset, upload_index
+    from .upload import generate_index_with_retry, upload_dataset, upload_index
 
     args = build_upload_parser().parse_args()
 
@@ -120,7 +121,7 @@ def upload_main() -> None:
             f"[cyan]{'Update existing files' if args.update else 'Skip existing files'}[/]"
         )
 
-    index: dict[str, str] | None = None
+    index: dict[str, dict[str, Any]] | None = None
 
     if not args.index_only:
         if args.bids_dir is None:
@@ -134,7 +135,7 @@ def upload_main() -> None:
     CONSOLE.rule("[bold blue]Step 2/3: Build Dataset Index")
     if args.rebuild_index or args.index_only or index is None:
         CONSOLE.print("[cyan]Generating index from OSF storage...[/]")
-        index = generate_index(token, args.project)
+        index = generate_index_with_retry(token, args.project)
     else:
         CONSOLE.print("[cyan]Using incrementally updated index from upload run...[/]")
     CONSOLE.print(f"[green]Index contains {len(index)} files.[/]")

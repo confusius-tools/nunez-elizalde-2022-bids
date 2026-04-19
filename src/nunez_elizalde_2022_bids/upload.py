@@ -22,6 +22,20 @@ OSF_PROJECT_ID = "43skw"
 BIDS_ROOT_NAME = "nunez-elizalde-2022-bids"
 INDEX_FILENAME = "dataset_index.json"
 CONSOLE = Console()
+IndexEntry = dict[str, str | int | None]
+DatasetIndex = dict[str, IndexEntry]
+_RETRYABLE_KEYWORDS = (
+    "status code 403",
+    "status code 404",
+    "status code 408",
+    "status code 429",
+    "status code 500",
+    "status code 502",
+    "status code 503",
+    "status code 504",
+    "connection error",
+    "timed out",
+)
 
 
 def _print_retry_message(
@@ -38,26 +52,16 @@ def _print_retry_message(
     )
 
 
-def _is_retryable_upload_error(exc: Exception) -> bool:
+def _is_retryable(exc: Exception) -> bool:
+    if isinstance(exc, AttributeError) and "'NoneType'" in str(exc):
+        return True
+
     msg = str(exc).lower()
     if isinstance(exc, RequestException):
         return True
     if not isinstance(exc, RuntimeError):
         return False
-    return any(
-        token in msg
-        for token in (
-            "status code 404",
-            "status code 408",
-            "status code 429",
-            "status code 500",
-            "status code 502",
-            "status code 503",
-            "status code 504",
-            "connection error",
-            "timed out",
-        )
-    )
+    return any(token in msg for token in _RETRYABLE_KEYWORDS)
 
 
 def _get_storage(token: str, project_id: str) -> Storage:
@@ -75,7 +79,7 @@ def _get_storage_with_retry(
         try:
             return _get_storage(token, project_id)
         except Exception as exc:
-            if attempt >= max_attempts or not _is_retryable_upload_error(exc):
+            if attempt >= max_attempts or not _is_retryable(exc):
                 raise
             wait_seconds = min(2 ** (attempt - 1), 30)
             time.sleep(wait_seconds)
@@ -83,7 +87,32 @@ def _get_storage_with_retry(
     raise RuntimeError("Failed to connect to OSF storage after retries.")
 
 
-def _load_remote_index(bids_root_folder: Storage) -> dict[str, str]:
+def _parse_index_entry(value: object) -> IndexEntry | None:
+    if not isinstance(value, dict):
+        return None
+
+    osf_path = value.get("osf_path")
+    if not isinstance(osf_path, str):
+        return None
+
+    size = value.get("size")
+    if not isinstance(size, int) or isinstance(size, bool):
+        size = None
+
+    return {"osf_path": osf_path, "size": size}
+
+
+def _get_index_osf_path(index: DatasetIndex, rel_path: str) -> str | None:
+    entry = index.get(rel_path)
+    if entry is None:
+        return None
+    osf_path = entry.get("osf_path")
+    if not isinstance(osf_path, str):
+        return None
+    return osf_path
+
+
+def _load_remote_index(bids_root_folder: Storage) -> DatasetIndex:
     try:
         index_file: File | None = None
         for remote_file in bids_root_folder.files:
@@ -104,7 +133,18 @@ def _load_remote_index(bids_root_folder: Storage) -> dict[str, str]:
     if not isinstance(payload, dict):
         return {}
 
-    return {str(key): value for key, value in payload.items() if isinstance(value, str)}
+    index: DatasetIndex = {}
+    for key, value in payload.items():
+        entry = _parse_index_entry(value)
+        if entry is None:
+            msg = (
+                "Invalid dataset_index.json schema: expected each entry to be "
+                "an object with {'osf_path': str, 'size': int | null}."
+            )
+            raise RuntimeError(msg)
+        index[str(key)] = entry
+
+    return index
 
 
 def _ensure_parent_folder(
@@ -275,32 +315,47 @@ def _upload_index_once(bids_root_folder: Storage, index_bytes: bytes) -> None:
         )
 
 
-def _build_index_with_retry(
-    token: str,
-    project_id: str,
-    max_attempts: int,
-) -> dict[str, str]:
+def _generate_index(storage: Storage) -> DatasetIndex:
+    """Walk remote OSF files and build the dataset index."""
     prefix = BIDS_ROOT_NAME + "/"
+    index: DatasetIndex = {}
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        TimeElapsedColumn(),
+        transient=True,
+    ) as progress:
+        task = progress.add_task("[cyan]Scanning OSF storage...[/]", total=None)
+        for remote_file in storage.files:
+            materialized = remote_file.path.lstrip("/")
+            if materialized.startswith(prefix):
+                rel_path = materialized[len(prefix) :]
+                if rel_path and rel_path != INDEX_FILENAME:
+                    size = getattr(remote_file, "size", None)
+                    if not isinstance(size, int) or isinstance(size, bool):
+                        size = None
+                    index[rel_path] = {
+                        "osf_path": remote_file.osf_path,
+                        "size": size,
+                    }
+                    progress.advance(task)
+
+    return index
+
+
+def generate_index_with_retry(
+    token: str,
+    project_id: str = OSF_PROJECT_ID,
+    max_attempts: int = 5,
+) -> DatasetIndex:
+    """Build the dataset index by scanning OSF storage with retries."""
     for attempt in range(1, max_attempts + 1):
         storage = _get_storage_with_retry(token, project_id, max_attempts=max_attempts)
-        index: dict[str, str] = {}
         try:
-            with Progress(
-                SpinnerColumn(),
-                TextColumn("[progress.description]{task.description}"),
-                TimeElapsedColumn(),
-                transient=True,
-            ) as progress:
-                task = progress.add_task("[cyan]Scanning OSF storage...[/]", total=None)
-                for remote_file in storage.files:
-                    materialized = remote_file.path.lstrip("/")
-                    if materialized.startswith(prefix):
-                        rel_path = materialized[len(prefix) :]
-                        if rel_path:
-                            index[rel_path] = remote_file.osf_path
-                            progress.advance(task)
+            return _generate_index(storage)
         except Exception as exc:
-            if attempt >= max_attempts or not _is_retryable_upload_error(exc):
+            if attempt >= max_attempts or not _is_retryable(exc):
                 raise
             wait_seconds = min(2 ** (attempt - 1), 30)
             _print_retry_message(
@@ -313,31 +368,9 @@ def _build_index_with_retry(
             time.sleep(wait_seconds)
             continue
 
-        return index
-
-    raise RuntimeError("Failed to build OSF dataset index after retries.")
-
-
-def generate_index(
-    token: str,
-    project_id: str = OSF_PROJECT_ID,
-) -> dict[str, str]:
-    """Build a path-to-OSF-ID index by walking OSF storage.
-
-    Parameters
-    ----------
-    token : str
-        OSF personal access token.
-    project_id : str, default: "43skw"
-        OSF project ID.
-
-    Returns
-    -------
-    index : dict[str, str]
-        Mapping from BIDS-relative file paths to OSF file paths
-        (e.g. ``"sub-CR020/ses-20191122/angio/...nii.gz": "/abc123..."``).
-    """
-    return _build_index_with_retry(token, project_id, max_attempts=5)
+    raise RuntimeError(
+        f"Failed to build OSF dataset index after {max_attempts} retries."
+    )
 
 
 def upload_dataset(
@@ -345,7 +378,7 @@ def upload_dataset(
     token: str,
     project_id: str = OSF_PROJECT_ID,
     update: bool = False,
-) -> dict[str, str]:
+) -> DatasetIndex:
     """Upload all files from a local BIDS directory to OSF.
 
     Files are uploaded under the ``nunez-elizalde-2022-bids/`` folder in the
@@ -365,9 +398,9 @@ def upload_dataset(
 
     Returns
     -------
-    index : dict[str, str]
-        Incrementally updated path-to-OSF-ID mapping suitable for
-        ``dataset_index.json`` upload.
+    index : dict[str, dict[str, str | int | None]]
+        Incrementally updated mapping suitable for ``dataset_index.json``
+        upload, containing OSF path and file size in bytes.
     """
     bids_dir = Path(bids_dir)
     all_files = sorted(path for path in bids_dir.rglob("*") if path.is_file())
@@ -394,7 +427,7 @@ def upload_dataset(
     else:
         CONSOLE.print("[yellow]No valid remote index found; starting from empty.[/]")
 
-    index: dict[str, str] = dict(remote_index)
+    index: DatasetIndex = dict(remote_index)
     uploaded = 0
     skipped = 0
 
@@ -416,7 +449,7 @@ def upload_dataset(
             rel_path = rel.as_posix()
             rel_dir = rel.parent.as_posix()
             filename = rel.name
-            known_osf_path = index.get(rel_path)
+            known_osf_path = _get_index_osf_path(index, rel_path)
 
             progress.update(
                 task,
@@ -427,6 +460,7 @@ def upload_dataset(
             )
 
             if not update and rel_path in index:
+                index[rel_path]["size"] = local_path.stat().st_size
                 skipped += 1
                 progress.advance(task)
                 continue
@@ -447,7 +481,7 @@ def upload_dataset(
                         known_osf_path=known_osf_path,
                     )
                 except Exception as exc:
-                    if attempt >= max_attempts or not _is_retryable_upload_error(exc):
+                    if attempt >= max_attempts or not _is_retryable(exc):
                         raise
 
                     wait_seconds = min(2 ** (attempt - 1), 30)
@@ -488,7 +522,12 @@ def upload_dataset(
                         osf_path = existing.osf_path
 
                 if osf_path is not None:
-                    index[rel_path] = osf_path
+                    index[rel_path] = {
+                        "osf_path": osf_path,
+                        "size": local_path.stat().st_size,
+                    }
+                elif rel_path in index:
+                    index[rel_path]["size"] = local_path.stat().st_size
                 break
 
             progress.advance(task)
@@ -501,7 +540,7 @@ def upload_dataset(
 
 
 def upload_index(
-    index: dict[str, str],
+    index: DatasetIndex,
     token: str,
     project_id: str = OSF_PROJECT_ID,
 ) -> None:
@@ -511,7 +550,7 @@ def upload_index(
 
     Parameters
     ----------
-    index : dict[str, str]
+    index : dict[str, dict[str, str | int | None]]
         Index dict as returned by `generate_index`.
     token : str
         OSF personal access token.
@@ -531,7 +570,7 @@ def upload_index(
             bids_root_folder = storage.create_folder(BIDS_ROOT_NAME, exist_ok=True)
             _upload_index_once(bids_root_folder, index_bytes)
         except Exception as exc:
-            if attempt >= max_attempts or not _is_retryable_upload_error(exc):
+            if attempt >= max_attempts or not _is_retryable(exc):
                 raise
             wait_seconds = min(2 ** (attempt - 1), 30)
             _print_retry_message(
