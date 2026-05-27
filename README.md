@@ -36,3 +36,8 @@ uv run nunez-convert --src /path/to/Subjects --out /path/to/output_bids
 ```
 
 Useful options: `--subjects`, `--overwrite`.
+
+## Licensing
+
+- **Code license:** BSD-3-Clause (`LICENSE`)
+- **Data license:** CC BY 4.0 (`licenses/DATA_LICENSE.md`)
