@@ -17,7 +17,7 @@ mice. This converter currently only exports the fUSI-related content.
 
 ## Outputs
 
-- Raw data: `sub-*/ses-*/fusi/*_pwd.nii.gz` (+ sidecars and events).
+- Raw data: `sub-*/ses-*/fusi/*_pwd.nii.gz` (+ sidecars and stimulus events).
 - Angiography: `sub-*/ses-*/angio/*_pwd.nii.gz`.
 - Derivatives: `derivatives/allenccf_align/sub-*/ses-*/fusi/*` plus
   `derivatives/allenccf_align/structure_tree_safe_2017.csv` for atlas label colors.
@@ -36,6 +36,9 @@ uv run nunez-convert --src /path/to/Subjects --out /path/to/output_bids
 ```
 
 Useful options: `--subjects`, `--overwrite`.
+
+Stimulus events are built with `cortexlab-fusi-utils` from each run's `Timeline.mat` and
+the bundled `Protocol.mat` files provided by the authors (not in the original dataset).
 
 ## Licensing
 

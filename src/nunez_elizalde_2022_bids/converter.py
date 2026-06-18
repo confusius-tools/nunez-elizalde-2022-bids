@@ -29,6 +29,8 @@ from scipy.io import loadmat
 from .config import STATIC_METADATA, TASK_DESCRIPTIONS
 
 STRUCTURE_TREE_FILENAME = "structure_tree_safe_2017.csv"
+REPO_ROOT = Path(__file__).resolve().parents[2]
+BUNDLED_PROTOCOLS_ROOT = REPO_ROOT / "inputs" / "protocols"
 
 
 @dataclass
@@ -884,6 +886,20 @@ def _timeline_path_for_run(plan: RunPlan) -> Path:
     return block_dir / f"{plan.date}_{plan.block}_{plan.subject}_Timeline.mat"
 
 
+def _bundled_protocol_path_for_run(plan: RunPlan) -> Path:
+    return BUNDLED_PROTOCOLS_ROOT / plan.subject / plan.date / str(plan.block) / "Protocol.mat"
+
+
+def _resolve_protocol_path_for_run(plan: RunPlan) -> Path:
+    bundled_protocol_path = _bundled_protocol_path_for_run(plan)
+    if not bundled_protocol_path.exists():
+        raise FileNotFoundError(
+            "Missing bundled Protocol.mat for run: "
+            f"{plan.subject} {plan.date} block {plan.block}: {bundled_protocol_path}"
+        )
+    return bundled_protocol_path
+
+
 def _session_acq_time_iso(runs: list[RunPlan]) -> str:
     if not runs:
         return "n/a"
@@ -911,77 +927,63 @@ def _session_acq_time_iso(runs: list[RunPlan]) -> str:
         return "n/a"
 
 
-def _parse_udp_event(raw_event: Any) -> list[str]:
-    if isinstance(raw_event, str):
-        return raw_event.split()
-    return []
-
-
-def _extract_stimulus_events(
-    timeline_path: Path,
+def _load_events_for_run(
+    plan: RunPlan,
     *,
     first_volume_time: float,
-    task_name: str,
-) -> list[dict[str, Any]]:
-    timeline = loadmat(timeline_path, simplify_cells=True).get("Timeline", {})
-    if not isinstance(timeline, dict):
-        return []
+) -> tuple[Any | None, dict[str, Any]]:
+    timeline_path = _timeline_path_for_run(plan)
+    event_info: dict[str, Any] = {
+        "timeline_mat": str(timeline_path),
+        "protocol_mat": None,
+    }
+    if not timeline_path.exists():
+        return None, event_info
 
-    raw_events = timeline.get("mpepUDPEvents", [])
-    raw_times = timeline.get("mpepUDPTimes", [])
+    try:
+        from cortexlab_fusi_utils.io import load_stimulus_events
+    except ImportError as exc:
+        raise RuntimeError(
+            "cortexlab-fusi-utils is required for stimulus event extraction. "
+            "Install dependencies with `uv sync` before converting."
+        ) from exc
 
-    if isinstance(raw_events, str):
-        events = [raw_events]
-    else:
-        events = np.asarray(raw_events, dtype=object).ravel().tolist()
-    times = np.asarray(raw_times, dtype=float).ravel().tolist()
+    protocol_path = _resolve_protocol_path_for_run(plan)
+    event_info["protocol_mat"] = str(protocol_path)
 
-    active_starts: defaultdict[tuple[str, str], list[tuple[float, str, str]]] = (
-        defaultdict(list)
+    events = load_stimulus_events(
+        timeline_path,
+        protocol_path=protocol_path,
+        onset_reference_time=first_volume_time,
+        timing_source="auto",
     )
-    rows: list[dict[str, Any]] = []
 
-    for raw_event, raw_time in zip(events, times, strict=False):
-        tokens = _parse_udp_event(raw_event)
-        if not tokens:
-            continue
+    events.insert(3, "task_name", plan.task)
+    column_descriptions = dict(events.attrs.get("column_descriptions", {}))
+    column_descriptions["task_name"] = (
+        "Session-level task label from the original session metadata."
+    )
+    events.attrs["column_descriptions"] = column_descriptions
 
-        tag = tokens[0]
-        if tag == "StimStart" and len(tokens) >= 7:
-            block_repeat = tokens[4]
-            stimulus_id = tokens[5]
-            stimulus_duration_code = tokens[6]
-            key = (block_repeat, stimulus_id)
-            active_starts[key].append(
-                (float(raw_time), stimulus_duration_code, str(raw_event))
-            )
-            continue
-
-        if tag == "StimEnd" and len(tokens) >= 6:
-            block_repeat = tokens[4]
-            stimulus_id = tokens[5]
-            key = (block_repeat, stimulus_id)
-            if not active_starts[key]:
-                continue
-            onset_abs, stimulus_duration_code, source_event = active_starts[key].pop(0)
-            duration = float(raw_time) - onset_abs
-            if duration <= 0:
-                continue
-
-            rows.append(
-                {
-                    "onset": onset_abs - first_volume_time,
-                    "duration": duration,
-                    "trial_type": task_name,
-                    "block_repeat": block_repeat,
-                    "stimulus_id": stimulus_id,
-                    "stimulus_duration_code": stimulus_duration_code,
-                    "source_event": source_event,
-                }
-            )
-
-    rows.sort(key=lambda row: float(row["onset"]))
-    return rows
+    preferred_columns = [
+        "onset",
+        "duration",
+        "trial_type",
+        "task_name",
+        "block_repeat",
+        "stimulus_duration_code",
+        "timing_source",
+        "software_onset",
+        "software_duration",
+        "hardware_onset",
+        "hardware_duration",
+        "source_event",
+    ]
+    ordered_columns = [column for column in preferred_columns if column in events.columns]
+    ordered_columns.extend(
+        column for column in events.columns if column not in ordered_columns
+    )
+    return events.loc[:, ordered_columns], event_info
 
 
 def _event_paths(output_nifti: Path) -> tuple[Path, Path]:
@@ -992,50 +994,36 @@ def _event_paths(output_nifti: Path) -> tuple[Path, Path]:
 
 
 def _write_events_files(
-    events_tsv: Path, events_json: Path, rows: list[dict[str, Any]]
+    events_tsv: Path,
+    events_json: Path,
+    events: Any,
 ) -> None:
-    fieldnames = [
+    events.to_csv(events_tsv, sep="\t", index=False, na_rep="")
+
+    column_descriptions = dict(events.attrs.get("column_descriptions", {}))
+    seconds_columns = {
         "onset",
         "duration",
-        "trial_type",
-        "block_repeat",
-        "stimulus_id",
-        "stimulus_duration_code",
-        "source_event",
-    ]
-    with events_tsv.open("w", newline="") as f:
-        writer = csv.DictWriter(f, delimiter="\t", fieldnames=fieldnames)
-        writer.writeheader()
-        for row in rows:
-            writer.writerow(row)
-
-    events_sidecar = {
-        "onset": {
-            "Description": "Event onset relative to the first acquired fUSI volume.",
-            "Units": "s",
-        },
-        "duration": {
-            "Description": "Event duration from matched StimStart/StimEnd UDP events.",
-            "Units": "s",
-        },
-        "trial_type": {
-            "Description": "Task label from session metadata.",
-        },
-        "block_repeat": {
-            "Description": "Within-block repeat index from stimulus UDP event payload.",
-        },
-        "stimulus_id": {
-            "Description": "Stimulus identity code from stimulus UDP event payload.",
-        },
-        "stimulus_duration_code": {
-            "Description": (
-                "Raw duration-like code from StimStart payload (e.g., 20 or 499)."
-            ),
-        },
-        "source_event": {
-            "Description": "Original StimStart UDP event string for provenance.",
-        },
+        "software_onset",
+        "software_duration",
+        "hardware_onset",
+        "hardware_duration",
     }
+
+    events_sidecar: dict[str, Any] = {}
+    for column in events.columns:
+        description = column_descriptions.get(column)
+        entry: dict[str, Any] = {}
+        if description:
+            entry["Description"] = description
+        if column in seconds_columns:
+            entry["Units"] = "s"
+        events_sidecar[column] = entry
+
+    xfile = events.attrs.get("xfile")
+    if xfile:
+        events_sidecar["StimulusPresentationXFile"] = str(xfile)
+
     events_json.write_text(json.dumps(events_sidecar, indent=2) + "\n")
 
 
@@ -1234,18 +1222,25 @@ def _convert_run(
     cf.save(da, plan.output_nifti)
 
     events_tsv, events_json = _event_paths(plan.output_nifti)
-    timeline_path = _timeline_path_for_run(plan)
-    events_rows: list[dict[str, Any]] = []
-    if timeline_path.exists():
-        events_rows = _extract_stimulus_events(
-            timeline_path,
-            first_volume_time=float(repaired_times[0]),
-            task_name=plan.task,
+    events, event_info = _load_events_for_run(
+        plan,
+        first_volume_time=float(repaired_times[0]),
+    )
+    result.update(
+        {
+            key: value
+            for key, value in event_info.items()
+            if value is not None
+        }
+    )
+    if events is not None and not events.empty:
+        _write_events_files(
+            events_tsv,
+            events_json,
+            events,
         )
-    if events_rows:
-        _write_events_files(events_tsv, events_json, events_rows)
         result["events_tsv"] = str(events_tsv)
-        result["n_events"] = len(events_rows)
+        result["n_events"] = int(len(events.index))
     else:
         events_tsv.unlink(missing_ok=True)
         events_json.unlink(missing_ok=True)
